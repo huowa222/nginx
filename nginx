@@ -38,3 +38,218 @@ connect:
 连接fd的可写回调函数
 开始会赋值为ngx_http_empty_handler，处理完请求头以后也会被赋值为ngx_http_request_handler。
 同时建立完请求结构体以后的操作也只修改请求结构体的write_event_handler函数指针了，最初该函数指针被赋值为ngx_http_core_run_phases，该函数是执行http的11个阶段。其实该函数并不是通过可写事件触发的，这点很重要。该函数压根就不是事件驱动的，如果非要说有事件，那只有超时事件。该函数是个死循环执行http的11个阶段的10个阶段。不要把执行权还给nginx框架，如果需求需要把执行权还给框架记得添加定时器回调，让定时器再次触发执行（例如：limit req module）或者通过自请求再触发（例如：auth request module）。读完请求body以后该函数指针被赋值为ngx_http_request_empty_handler函数，此时处理阶段可能还在执行，可以在处理阶段调用ngx_http_send_header发送resp或者调用ngx_http_finalize_request结束请求。当处理阶段把执行权归还给nginx该请求处理结束。
+
+
+
+先看几个主要方法
+ngx_add_channel_event 主要是把事件注册到事件池中，并且添加事件 handler，具体要结合后面的事件机制来展开。
+
+ngx_write_channel 主要是将数据写入到 pipe 中：
+
+       n = sendmsg(s, &msg, 0);
+
+       Top of Form
+
+       Bottom of Form
+
+ngx_read_channel 从 pipe 中读取数据：n = recvmsg(s, &msg, 0);
+
+ 
+
+接下来分析事件模块工作流程
+
+ 
+
+ngx_event模块结构
+
+ngx_events_module 的数据结构如下：
+
+ngx_module_t ngx_events_module = { 
+
+        NGX_MODULE_V1, 
+
+        &ngx_events_module_ctx, /* module context */
+
+        ngx_events_commands, /* module directives */
+
+        NGX_CORE_MODULE, /* module type */ 
+
+        NULL, /* init master */ 
+
+        NULL, /* init module */ 
+
+        NULL, /* init process */ 
+
+        NULL, /* init thread */ 
+
+        NULL, /* exit thread */ 
+
+        NULL, /* exit process */ 
+
+        NULL, /* exit master */
+
+        NGX_MODULE_V1_PADDING 
+
+};
+
+ 
+
+ngx_event 模块初始化
+
+static ngx_command_t ngx_events_commands[] = {   
+
+        {
+
+                ngx_string("events") , 
+
+                NGX_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_NOARGS , 
+
+                 ngx_events_block, 0, 0, NULL 
+
+         },   
+
+        ngx_null_command
+
+};
+
+ 
+
+通过 ngx_events_commands 数组可以知道，event 模块初始化函数为 ngx_events_block，该函数工作内容如下：
+
+ 
+
+创建模块 context 结构
+
+调用所有 NGX_EVENT_MODULE 模块的 create_conf
+
+解析 event 配置
+
+调用所有 NGX_EVENT_MODULE 模块的 init_conf
+
+ 
+
+ngx_core_event模块初始化
+
+ngx_core_event_module 是在 ngx_cycle_init 的时候初始化的：
+
+ 
+
+for (i = 0; ngx_modules[i]; i++) { 
+
+        if (ngx_modules[i]->init_module) { 
+
+                if (ngx_modules[i]->init_module(cycle) != NGX_OK) { /* fatal */ 
+
+                        exit(1); 
+
+                } 
+
+         } 
+
+}
+
+ 
+
+我们先来看下 ngx_core_event_module 的结构：
+
+ngx_module_t ngx_event_core_module = { 
+
+        NGX_MODULE_V1, 
+
+        &ngx_event_core_module_ctx, /* module context */
+
+        ngx_event_core_commands, /* module directives */
+
+        NGX_EVENT_MODULE, /* module type */ 
+
+        NULL, /* init master */
+
+        ngx_event_module_init, /* init module */
+
+        ngx_event_process_init, /* init process */ 
+
+        NULL, /* init thread */ 
+
+        NULL, /* exit thread */ 
+
+        NULL, /* exit process */ 
+
+        NULL, /* exit master */ NGX_MODULE_V1_PADDING
+
+};
+
+ 
+
+ngx_event_module_init 实现了初始化过程，该过程分以下几个步骤：
+
+连接数校验
+
+初始化互斥锁
+
+ 
+
+事件进程初始化
+
+在工作线程初始化的时候，将会调用 ngx_event_process_init:
+
+for (i = 0; ngx_modules[i]; i++) { 
+
+        if (ngx_modules[i]->init_process)  { 
+
+                if (ngx_modules[i]->init_process(cycle) == NGX_ERROR) { /*fatal */ 
+
+                      exit(2); 
+
+                } 
+
+        } 
+
+}
+
+ 
+
+ngx_event_process_init 该过程分以下几步：
+
+设置 ngx_accept_mutex_held
+
+初始化定时器
+
+初始化真正的事件引擎（linux 中为 epoll）
+
+初始化连接池
+
+添加 accept 事件
+
+ 
+
+ngx_process_events_and_timers 事件处理开始工作
+
+工作流程如下：
+
+ngx_trylock_accept_mutex 当获取到标志位后才进行 accept 事件注册。
+
+ngx_process_events 处理事件
+
+释放 accept_mutex 锁
+
+处理定时器事件
+
+ngx_event_process_posted 处理 posted 队列的事件
+
+ 
+
+ngx 定时器实现
+
+ngx 的定时器利用了红黑树的实现
+
+ 
+
+ngx 惊群处理
+
+accept_mutex 解决了惊群问题，虽然linux的新内核已经解决了这个问题，但是ngx 是为了兼容。
+
+ 
+
+整体原理图：
+
+
