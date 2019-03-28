@@ -1,0 +1,40 @@
+概述
+nginx作为代理服务器，处理网络读写事件是其核心。在linux平台上使用epoll管理网络读写事件使得nginx有很高的性能，再配合定时器事件可以实现一些超时和控制速率的一些功能。
+
+而nginx又是如何使用epoll，又是何时添加可读、可写、定时事件的呢？
+
+代码分析
+以下是部分事件的回调函数，缩进代表了调用层级。
+后续会补充对应事件是被何时添加到epoll中的，是使用的水平触发还是边沿触发。定时器是何时使用的。
+
+// 监听的fd事件回调
+listen:rev->handler = ngx_event_accept;   // -> ls->handler();
+    ls->handler = ngx_http_init_connection;
+
+// 建立起连接的fd的事件回调http模块
+connect:
+    c->recv = ngx_recv;
+    c->rev->handler = ngx_http_wait_request_handler;
+        r->read_event_handler = ngx_http_block_reading;
+        c->rev->handler = ngx_http_process_request_line;
+            c->rev->handler = ngx_http_process_request_headers;
+                ngx_http_process_request_header();
+                ngx_http_process_request();
+                        c->read->handler = ngx_http_request_handler;
+                        r->read_event_handler = ngx_http_block_reading;
+                        ngx_http_handler(r);
+                            ngx_http_core_run_phases(r);
+
+
+    c->write->handler = ngx_http_empty_handler;
+                        c->write->handler = ngx_http_request_handler;
+                            r->write_event_handler = ngx_http_core_run_phases;
+总结：
+监听fd的可读回调函数一直是ngx_event_accept，没有被修改过也不会被修改。
+当有可读事件会调用该函数建立连接，http模块会调用ngx_http_init_connection函数。
+连接的fd可读回调函数
+会赋值为ngx_http_wait_request_handler等待处理请求，当有内容可读以后会赋值为ngx_http_process_request_line函数处理请求行。处理完毕请求行会被赋值为ngx_http_process_request_headers处理请求头，处理完请求头会被赋值为ngx_http_request_handler。
+至此请求结构体以建立，以后的操作就是修改请求结构体的read_event_handler回调函数的指针了。开始该函数指针被赋值为ngx_http_block_reading函数，该函数会把水平触发的可读fd从epoll删除，也就是说不关心可读事件了，那什么时候关心呢？请求行已经读取处理完毕接下来的可读有两种情况：1，关闭连接，当需要监听客户端关闭连接时该函数指针被赋值为ngx_http_upstream_rd_check_broken_connection，目前也只有http 的upstream模块使用了。2，需要读body内容。body内容有两个函数关心：其一就是读body内容后执行一个回调的函数ngx_http_read_client_request_body。其二丢弃body的函数ngx_http_discard_request_body。当需要处理body内容的时候，该回调函数指针会被赋值为ngx_http_read_client_request_body_handler或ngx_http_discarded_request_body_handler。当读取完body后该回调指针又被赋值为ngx_http_block_reading了。
+连接fd的可写回调函数
+开始会赋值为ngx_http_empty_handler，处理完请求头以后也会被赋值为ngx_http_request_handler。
+同时建立完请求结构体以后的操作也只修改请求结构体的write_event_handler函数指针了，最初该函数指针被赋值为ngx_http_core_run_phases，该函数是执行http的11个阶段。其实该函数并不是通过可写事件触发的，这点很重要。该函数压根就不是事件驱动的，如果非要说有事件，那只有超时事件。该函数是个死循环执行http的11个阶段的10个阶段。不要把执行权还给nginx框架，如果需求需要把执行权还给框架记得添加定时器回调，让定时器再次触发执行（例如：limit req module）或者通过自请求再触发（例如：auth request module）。读完请求body以后该函数指针被赋值为ngx_http_request_empty_handler函数，此时处理阶段可能还在执行，可以在处理阶段调用ngx_http_send_header发送resp或者调用ngx_http_finalize_request结束请求。当处理阶段把执行权归还给nginx该请求处理结束。
